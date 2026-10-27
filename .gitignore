@@ -1,6 +1,14 @@
-# 上传的临时文件
+# 上传的临时文件（用户私有文档，禁止提交）
 rag-backend/uploads/
 uploads/
+
+# PDF 文档（私有内容，禁止提交）
+*.pdf
+
+# 向量数据库（由上传的私有文档生成，禁止提交）
+rag-backend/chroma_db/
+chroma_db/
+*.sqlite3
 
 # 环境变量
 .env
