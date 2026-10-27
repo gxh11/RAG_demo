@@ -28,11 +28,11 @@ def extract_text_from_pdf(file_path):
     return text
 
 
-def process_and_store_pdf(file_path):
+def process_and_store_pdf(file_path, user_id=None):
     text = extract_text_from_pdf(file_path)
     if not text.strip():
-        print("警告：PDF 解析结果为空")
-        return
+        # 解析不出文字就不算成功，明确报错，避免用户以为卡住
+        raise ValueError("PDF 中没有提取到文字，可能是扫描件或图片型 PDF，暂不支持")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
@@ -46,8 +46,13 @@ def process_and_store_pdf(file_path):
     embeddings_list = embeddings.tolist()
     print(f"向量化完成，维度: {len(embeddings_list[0])}")
 
-    ids = [f"chunk_{i}" for i in range(len(chunks))]
-    metadatas = [{"source": os.path.basename(file_path), "chunk_index": i} for i in range(len(chunks))]
+    # ids 带上用户与文件前缀，避免不同账号/文件之间冲突
+    prefix = f"u{user_id}_{os.path.basename(file_path)}" if user_id is not None else os.path.basename(file_path)
+    ids = [f"{prefix}_chunk_{i}" for i in range(len(chunks))]
+    metadatas = [
+        {"source": os.path.basename(file_path), "chunk_index": i, "user_id": user_id if user_id is not None else -1}
+        for i in range(len(chunks))
+    ]
 
     collection.add(
         embeddings=embeddings_list,
@@ -65,20 +70,24 @@ openrouter_client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-def ask_question_stream(user_question: str):
-    """RAG 问答核心逻辑（流式）：问题向量化 -> 检索 -> 大模型逐段生成回答"""
+def ask_question_stream(user_question: str, user_id=None):
+    """RAG 问答核心逻辑（流式）：问题向量化 -> 按账号检索 -> 大模型逐段生成回答"""
 
     # 1. 把用户问题变成向量（用本地模型，和存库时用的一模一样）
     query_embedding = embedding_model.encode(user_question, normalize_embeddings=True).tolist()
 
-    # 2. 去 ChromaDB 里检索最相似的 3 个文本块
+    # 2. 只在当前账号上传的文档里检索最相似的 3 个文本块
+    where = {"user_id": user_id} if user_id is not None else None
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=3
+        n_results=3,
+        where=where,
     )
 
     # 取出检索到的文本块，拼成一整段背景信息
-    documents = results['documents'][0]  # 这是一个列表
+    documents = results['documents'][0] if results['documents'] else []  # 这是一个列表
+    if not documents:
+        raise ValueError("没有检索到你上传的文档内容，请先上传 PDF 并等待解析完成")
     context = "\n\n".join(documents)
 
     print(f"🔍 检索到 {len(documents)} 个相关块，总字数: {len(context)}")

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pathlib import Path
@@ -9,7 +9,15 @@ import jwt
 import bcrypt
 from rag_engine import process_and_store_pdf
 from pydantic import BaseModel
-from db import init_db, save_upload_record, get_all_records, get_user_by_username, create_user
+from db import (
+    init_db,
+    save_upload_record,
+    update_upload_status,
+    get_records_by_user,
+    has_successful_upload,
+    get_user_by_username,
+    create_user,
+)
 app = FastAPI(title="PDF 接收接口")
 @app.on_event("startup")
 def on_startup():
@@ -23,6 +31,8 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
+        "http://rag.zkqcoc.shop",
+        "https://rag.zkqcoc.shop",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -32,8 +42,8 @@ app.add_middleware(
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# 是否已有 PDF 成功上传并向量化（必须先上传 PDF 才能提问）
-pdf_uploaded = False
+# 各账号的后台解析状态：username -> {"state": "processing"/"done"/"error", "filename": ..., "message": ...}
+user_processing = {}
 
 # 20MB
 MAX_SIZE = 20 * 1024 * 1024
@@ -52,12 +62,29 @@ def extract_text_from_pdf(file_path: Path) -> str:
         print(f"解析 PDF 失败: {e}")
         text = "【解析失败，可能文件已加密或损坏】"
     return text
+def process_pdf_task(record_id, file_path: Path, user_id, username, original_name):
+    """后台任务：解析 PDF 并向量化入库（不阻塞上传响应）"""
+    user_processing[username] = {"state": "processing", "filename": original_name}
+    try:
+        process_and_store_pdf(file_path, user_id)
+        update_upload_status(record_id, "success")
+        user_processing[username] = {"state": "done", "filename": original_name}
+        print(f"✅ 后台解析完成: {original_name} (user_id={user_id})")
+    except Exception as e:
+        update_upload_status(record_id, "failed")
+        user_processing[username] = {"state": "error", "filename": original_name, "message": str(e)}
+        print(f"❌ 后台解析失败: {original_name}: {e}")
+
+
 @app.post("/api/accept")
 async def accept_pdf(
+    request: Request,
+    background_tasks: BackgroundTasks,
     pdf: UploadFile = File(...),
     customerName: str = Form(...),
     remark: str = Form(""),
 ):
+    username, user_id = require_login(request)
     # 1. 基础校验
     if not pdf.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
@@ -112,35 +139,33 @@ async def accept_pdf(
         file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="文件内容不是有效的 PDF")
 
-    # 5. 处理 PDF（解析 + 向量化 + 入库）
-    print(f"正在处理文件: {saved_name}")
-    process_and_store_pdf(file_path)  # 👈 调用 rag_engine.py 里的核心函数
+    # 5. 写入记录（状态 processing），交给后台解析，立即返回
     record_id = save_upload_record(
+        user_id=user_id,
         original_name=original_name,
         saved_name=saved_name,
         size=size,
         customer_name=customerName,
         remark=remark,
         text_length=0,
-        status="success",
+        status="processing",
     )
-    print(f"✅ 已写入数据库，记录 ID: {record_id}")
+    print(f"✅ 已写入数据库，记录 ID: {record_id}，后台开始解析")
+    user_processing[username] = {"state": "processing", "filename": original_name}
+    background_tasks.add_task(process_pdf_task, record_id, file_path, user_id, username, original_name)
 
-    # 标记已有 PDF 成功上传，允许后续提问
-    global pdf_uploaded
-    pdf_uploaded = True
-
-    # 6. 返回结果（不再需要返回完整 textContent，因为已经存进数据库了）
+    # 6. 上传已完成即返回，解析在后台继续，用户可以离开页面
     return {
         "code": 0,
-        "message": "上传并向量化成功",
+        "message": "上传完成，后台正在解析文件",
         "data": {
             "originalName": original_name,
             "savedName": saved_name,
             "size": size,
             "customerName": customerName,
             "remark": remark,
-            "backendTip": "🎉 PDF 已成功解析并存入向量数据库！",
+            "status": "processing",
+            "backendTip": "上传已完成，后台正在解析文件并建立索引，现在可以退出页面，稍后回来即可提问。",
         },
     }
 from rag_engine import process_and_store_pdf, ask_question_stream
@@ -149,22 +174,45 @@ class ChatRequest(BaseModel):
     question: str
 
 @app.post("/api/chat")
-async def chat_with_pdf(req: ChatRequest):
-    """接收用户提问，流式返回 AI 回答（必须先上传 PDF）"""
-    if not pdf_uploaded:
+async def chat_with_pdf(request: Request, req: ChatRequest):
+    """接收用户提问，流式返回 AI 回答（需登录，只能问自己上传的文档）"""
+    username, user_id = require_login(request)
+
+    if user_processing.get(username, {}).get("state") == "processing":
+        raise HTTPException(status_code=400, detail="文件正在后台解析，请稍后再试")
+    if not has_successful_upload(user_id):
         raise HTTPException(status_code=400, detail="请先上传 PDF 文件，再进行提问")
 
     def generate():
         try:
-            for delta in ask_question_stream(req.question):
+            for delta in ask_question_stream(req.question, user_id):
                 yield delta
         except Exception as e:
             yield f"\n❌ AI 回答失败: {str(e)}"
 
     return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/api/upload-status")
+async def upload_status(request: Request):
+    """查询当前账号的解析状态和上传记录（前端轮询 / 恢复页面状态用）"""
+    username, user_id = require_login(request)
+    state = user_processing.get(username, {"state": "idle"})
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "processing": state,
+            "hasPdf": has_successful_upload(user_id),
+            "files": get_records_by_user(user_id),
+        },
+    }
+
+
 @app.get("/api/records")
-async def list_records(limit: int = 50):
-    return {"code": 0, "message": "success", "data": get_all_records(limit)}
+async def list_records(request: Request, limit: int = 50):
+    _, user_id = require_login(request)
+    return {"code": 0, "message": "success", "data": get_records_by_user(user_id, limit)}
 
 
 # ============ 登录鉴权（JWT） ============
@@ -204,6 +252,17 @@ def get_current_user(request: Request) -> str:
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="无效的登录凭证")
+
+
+def require_login(request: Request):
+    """要求登录，返回 (username, user_id)"""
+    username = get_current_user(request)
+    if not username:
+        raise HTTPException(status_code=401, detail="请先登录")
+    user = get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    return username, user.id
 
 
 @app.post("/api/register")

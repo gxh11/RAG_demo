@@ -5,11 +5,11 @@ import { useRouter } from 'next/navigation';
 import { API_BASE } from '@/lib/api';
 
 interface AcceptFileState {
-  file: File;
+  file: File | null;
   name: string;
   size: string;
   progress: number;
-  status: 'idle' | 'submitting' | 'success' | 'error';
+  status: 'idle' | 'uploading' | 'processing' | 'success' | 'error';
   errorMessage?: string;
 }
 
@@ -25,6 +25,14 @@ export default function CustomerPdfAcceptPage() {
       return;
     }
     setUsername(localStorage.getItem('rag_username') || '');
+    // 刷新后台解析状态：中途离开页面再回来也能恢复
+    refreshUploadStatus().then((state) => {
+      if (state === 'processing') {
+        setFileState({ file: null, name: '上次上传的 PDF', size: '-', progress: 100, status: 'processing' });
+        startPolling();
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
 
   // ============ 已有的状态 ============
@@ -39,8 +47,59 @@ export default function CustomerPdfAcceptPage() {
   const [answer, setAnswer] = useState('');
   const [isAsking, setIsAsking] = useState(false);
 
-  // 是否已成功上传 PDF（未上传时不允许提问）
-  const isUploaded = fileState?.status === 'success';
+  // 该账号已有解析完成的文档（离开页面后回来恢复状态）
+  const [hasReadyDoc, setHasReadyDoc] = useState(false);
+
+  // 是否可以提问（本次上传解析完成，或账号已有解析完成的文档）
+  const isUploaded = fileState?.status === 'success' || hasReadyDoc;
+
+  // ============ 后台解析状态查询 / 轮询 ============
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const refreshUploadStatus = async (): Promise<'processing' | 'done' | 'error' | 'idle'> => {
+    const token = localStorage.getItem('rag_token');
+    if (!token) return 'idle';
+    try {
+      const res = await fetch(`${API_BASE}/api/upload-status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return 'idle';
+      const data = await res.json();
+      const state = data?.data?.processing?.state;
+      const hasPdf = Boolean(data?.data?.hasPdf);
+      if (hasPdf) setHasReadyDoc(true);
+      if (state === 'processing') return 'processing';
+      if (state === 'error') return 'error';
+      return hasPdf ? 'done' : 'idle';
+    } catch {
+      return 'idle';
+    }
+  };
+
+  const stopPolling = () => {
+    if (pollTimer.current) {
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+  };
+
+  const startPolling = () => {
+    if (pollTimer.current) return;
+    pollTimer.current = setInterval(async () => {
+      const state = await refreshUploadStatus();
+      if (state === 'done') {
+        stopPolling();
+        setFileState((prev) => (prev ? { ...prev, status: 'success', progress: 100 } : prev));
+      } else if (state === 'error') {
+        stopPolling();
+        setFileState((prev) =>
+          prev ? { ...prev, status: 'error', errorMessage: '后台解析失败，请重新上传' } : prev
+        );
+      }
+    }, 3000);
+  };
+
+  useEffect(() => () => stopPolling(), []);
 
   // 格式化文件尺寸
   const formatFileSize = (bytes: number) => {
@@ -95,10 +154,10 @@ export default function CustomerPdfAcceptPage() {
   };
 
   const handleSubmit = async () => {
-    if (!fileState) return;
+    if (!fileState?.file) return;
 
     setFileState((prev) =>
-      prev ? { ...prev, status: 'submitting', progress: 0, errorMessage: undefined } : null
+      prev ? { ...prev, status: 'uploading', progress: 0, errorMessage: undefined } : null
     );
 
     const formData = new FormData();
@@ -108,25 +167,36 @@ export default function CustomerPdfAcceptPage() {
 
     const progressInterval = setInterval(() => {
       setFileState((prev) => {
-        if (!prev || prev.status !== 'submitting') return prev;
+        if (!prev || prev.status !== 'uploading') return prev;
         if (prev.progress >= 90) return prev;
         return { ...prev, progress: Math.min(prev.progress + 15, 90) };
       });
     }, 200);
 
     try {
+      const token = localStorage.getItem('rag_token');
       const response = await fetch(`${API_BASE}/api/accept`, {
         method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         body: formData,
       });
 
       clearInterval(progressInterval);
 
-      if (!response.ok) throw new Error('提交失败，请稍后重试');
+      if (response.status === 401) {
+        localStorage.removeItem('rag_token');
+        router.replace('/login');
+        return;
+      }
 
+      const result = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(result?.detail || '提交失败，请稍后重试');
+
+      // 上传已完成，转后台解析，轮询解析进度
       setFileState((prev) =>
-        prev ? { ...prev, progress: 100, status: 'success' } : null
+        prev ? { ...prev, progress: 100, status: 'processing' } : null
       );
+      startPolling();
     } catch (err: unknown) {
       clearInterval(progressInterval);
       setFileState((prev) =>
@@ -142,6 +212,7 @@ export default function CustomerPdfAcceptPage() {
   };
 
   const handleReset = () => {
+    stopPolling();
     setFileState(null);
     setCustomerName('');
     setRemark('');
@@ -165,9 +236,13 @@ export default function CustomerPdfAcceptPage() {
     setAnswer('');
 
     try {
+      const token = localStorage.getItem('rag_token');
       const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({ question }),
       });
 
@@ -272,10 +347,34 @@ export default function CustomerPdfAcceptPage() {
       {fileState && (
         <div style={{ border: '1px solid #eee', borderRadius: 8, padding: 16, fontSize: 13 }}>
           <div>文件名称：{fileState.name}</div>
-          <div>文件大小：{fileState.size}</div>
-          <div>当前状态：{fileState.status}</div>
-          {fileState.status === 'error' && <div style={{ color: 'red' }}>{fileState.errorMessage}</div>}
-          {fileState.status === 'success' && <div style={{ color: 'green' }}>上传成功</div>}
+          {fileState.file && <div>文件大小：{fileState.size}</div>}
+          <div>
+            当前状态：
+            {fileState.status === 'idle' && '待提交'}
+            {fileState.status === 'uploading' && '正在上传文件…'}
+            {fileState.status === 'processing' && '上传完成，后台正在解析文件…'}
+            {fileState.status === 'success' && '解析完成'}
+            {fileState.status === 'error' && '出错了'}
+          </div>
+          {fileState.status === 'uploading' && (
+            <div style={{ marginTop: 8, height: 6, background: '#f0f0f0', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ width: `${fileState.progress}%`, height: '100%', background: '#1677ff', transition: 'width 0.2s' }} />
+            </div>
+          )}
+          {fileState.status === 'processing' && (
+            <div style={{ marginTop: 10, padding: '8px 12px', background: '#e6f4ff', border: '1px solid #91caff', borderRadius: 6, color: '#003eb3', lineHeight: 1.6 }}>
+              上传已完成，后台正在解析文件并建立索引。现在可以退出页面，稍后回来即可提问。
+            </div>
+          )}
+          {fileState.status === 'error' && <div style={{ color: 'red', marginTop: 6 }}>{fileState.errorMessage}</div>}
+          {fileState.status === 'success' && <div style={{ color: 'green', marginTop: 6 }}>解析完成，可以开始提问</div>}
+        </div>
+      )}
+
+      {/* 该账号已有可提问的文档 */}
+      {!fileState && hasReadyDoc && (
+        <div style={{ padding: '8px 12px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, fontSize: 13, color: '#135200' }}>
+          该账号已有解析完成的文档，可以直接在下方提问。
         </div>
       )}
 
@@ -284,10 +383,10 @@ export default function CustomerPdfAcceptPage() {
         <button
           type="button"
           onClick={handleSubmit}
-          disabled={!fileState || fileState.status === 'submitting' || fileState.status === 'success'}
+          disabled={!fileState?.file || fileState.status === 'uploading' || fileState.status === 'processing' || fileState.status === 'success'}
           style={{ flex: 1, padding: '10px 16px', color: '#fff', background: '#1677ff', border: 'none', borderRadius: 6, cursor: 'pointer' }}
         >
-          {fileState?.status === 'submitting' ? '提交中...' : '提交'}
+          {fileState?.status === 'uploading' ? '上传中...' : fileState?.status === 'processing' ? '解析中...' : '提交'}
         </button>
         <button
           type="button"
@@ -303,7 +402,11 @@ export default function CustomerPdfAcceptPage() {
         <h3 style={{ marginTop: 0 }}>💬 向 PDF 提问</h3>
         {!isUploaded && (
           <div style={{ marginBottom: 12, padding: '8px 12px', background: '#fffbe6', border: '1px solid #ffe58f', borderRadius: 6, fontSize: 13, color: '#874d00' }}>
-            请先上传 PDF 文件，上传成功后即可提问
+            {fileState?.status === 'processing'
+              ? '文件正在后台解析，完成后即可提问（解析期间可以离开页面）'
+              : fileState?.status === 'uploading'
+                ? '正在上传文件，请稍候…'
+                : '请先上传 PDF 文件，上传成功后即可提问'}
           </div>
         )}
         <div style={{ display: 'flex', gap: 8 }}>

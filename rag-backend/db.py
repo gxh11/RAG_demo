@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
@@ -16,6 +16,7 @@ class UploadRecord(Base):
     __tablename__ = "upload_records"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True, nullable=True)  # 关联 users.id
     original_name = Column(String(255), nullable=False)
     saved_name = Column(String(255), nullable=False)
     size = Column(Integer, nullable=False)
@@ -57,12 +58,20 @@ def create_user(username, password_hash):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # 兼容旧表：为 upload_records 补上 user_id 列
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE upload_records ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+    except Exception:
+        # SQLite 等不支持 IF NOT EXISTS 的库，失败则忽略（新表已含该列）
+        pass
 
 
-def save_upload_record(original_name, saved_name, size, customer_name, remark, text_length, status="success"):
+def save_upload_record(user_id, original_name, saved_name, size, customer_name, remark, text_length, status="processing"):
     db = SessionLocal()
     try:
         record = UploadRecord(
+            user_id=user_id,
             original_name=original_name,
             saved_name=saved_name,
             size=size,
@@ -79,23 +88,68 @@ def save_upload_record(original_name, saved_name, size, customer_name, remark, t
         db.close()
 
 
+def update_upload_status(record_id, status, text_length=None):
+    db = SessionLocal()
+    try:
+        record = db.query(UploadRecord).filter(UploadRecord.id == record_id).first()
+        if record:
+            record.status = status
+            if text_length is not None:
+                record.text_length = text_length
+            db.commit()
+    finally:
+        db.close()
+
+
+def _record_to_dict(r):
+    return {
+        "id": r.id,
+        "userId": r.user_id,
+        "originalName": r.original_name,
+        "savedName": r.saved_name,
+        "size": r.size,
+        "customerName": r.customer_name,
+        "remark": r.remark,
+        "textLength": r.text_length,
+        "status": r.status,
+        "createdAt": r.created_at.isoformat(),
+    }
+
+
+def get_records_by_user(user_id, limit=50):
+    """按账号取上传记录"""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(UploadRecord)
+            .filter(UploadRecord.user_id == user_id)
+            .order_by(UploadRecord.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [_record_to_dict(r) for r in rows]
+    finally:
+        db.close()
+
+
+def has_successful_upload(user_id):
+    """该账号是否已有解析完成、可提问的文档"""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(UploadRecord)
+            .filter(UploadRecord.user_id == user_id, UploadRecord.status == "success")
+            .count()
+            > 0
+        )
+    finally:
+        db.close()
+
+
 def get_all_records(limit=50):
     db = SessionLocal()
     try:
         rows = db.query(UploadRecord).order_by(UploadRecord.created_at.desc()).limit(limit).all()
-        return [
-            {
-                "id": r.id,
-                "originalName": r.original_name,
-                "savedName": r.saved_name,
-                "size": r.size,
-                "customerName": r.customer_name,
-                "remark": r.remark,
-                "textLength": r.text_length,
-                "status": r.status,
-                "createdAt": r.created_at.isoformat(),
-            }
-            for r in rows
-        ]
+        return [_record_to_dict(r) for r in rows]
     finally:
         db.close()
