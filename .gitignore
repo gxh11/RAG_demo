@@ -1,11 +1,10 @@
-# 环境变量（绝对不能提交）
-.env
-rag-backend/.env
-*.env
-
 # 上传的临时文件
 rag-backend/uploads/
 uploads/
+
+# 环境变量
+.env
+rag-backend/.env
 
 # Python
 __pycache__/

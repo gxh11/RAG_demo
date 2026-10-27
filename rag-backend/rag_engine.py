@@ -65,9 +65,9 @@ openrouter_client = OpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-def ask_question(user_question: str) -> str:
-    """RAG 问答核心逻辑：问题向量化 -> 检索 -> 交给大模型生成回答"""
-    
+def ask_question_stream(user_question: str):
+    """RAG 问答核心逻辑（流式）：问题向量化 -> 检索 -> 大模型逐段生成回答"""
+
     # 1. 把用户问题变成向量（用本地模型，和存库时用的一模一样）
     query_embedding = embedding_model.encode(user_question, normalize_embeddings=True).tolist()
 
@@ -76,11 +76,11 @@ def ask_question(user_question: str) -> str:
         query_embeddings=[query_embedding],
         n_results=3
     )
-    
+
     # 取出检索到的文本块，拼成一整段背景信息
     documents = results['documents'][0]  # 这是一个列表
     context = "\n\n".join(documents)
-    
+
     print(f"🔍 检索到 {len(documents)} 个相关块，总字数: {len(context)}")
 
     # 3. 拼装 Prompt
@@ -93,11 +93,18 @@ def ask_question(user_question: str) -> str:
 用户问题：{user_question}
 """
 
-    # 4. 调用 OpenRouter 的 NVIDIA 模型
+    # 4. 调用 OpenRouter 的 NVIDIA 模型（stream=True 开启流式输出）
     response = openrouter_client.chat.completions.create(
         model="nvidia/nemotron-3.5-lightning:free",  # 如果限流，可以换成 "meta-llama/llama-3.3-70b-instruct:free"
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
+        stream=True,
     )
 
-    return response.choices[0].message.content
+    # 5. 逐段 yield 生成的文本，供接口做流式返回
+    for chunk in response:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta

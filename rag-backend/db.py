@@ -26,6 +26,35 @@ class UploadRecord(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+def get_user_by_username(username):
+    db = SessionLocal()
+    try:
+        return db.query(User).filter(User.username == username).first()
+    finally:
+        db.close()
+
+
+def create_user(username, password_hash):
+    db = SessionLocal()
+    try:
+        user = User(username=username, password_hash=password_hash)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user.id
+    finally:
+        db.close()
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
